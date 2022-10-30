@@ -1,3 +1,5 @@
+from PIL import Image
+import io
 from slugify import slugify
 from amcrest import AmcrestCamera, AmcrestError
 from datetime import datetime, timezone
@@ -8,19 +10,19 @@ from json import dumps
 import signal
 from threading import Timer
 import ssl
-import asyncio
+from dotenv import load_dotenv
 
 is_exiting = False
 mqtt_client = None
+
+load_dotenv()
 
 # Read env variables
 amcrest_host = os.getenv("AMCREST_HOST")
 amcrest_port = int(os.getenv("AMCREST_PORT") or 80)
 amcrest_username = os.getenv("AMCREST_USERNAME") or "admin"
 amcrest_password = os.getenv("AMCREST_PASSWORD")
-
 storage_poll_interval = int(os.getenv("STORAGE_POLL_INTERVAL") or 3600)
-device_name = os.getenv("DEVICE_NAME")
 
 mqtt_host = os.getenv("MQTT_HOST") or "localhost"
 mqtt_qos = int(os.getenv("MQTT_QOS") or 0)
@@ -52,6 +54,14 @@ def log(msg, level="INFO"):
     ts = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M:%S")
     print(f"{ts} [{level}] {msg}")
 
+def sendSnapshot(camera, mqttTopic):
+   snapshot = camera.snapshot().read()
+   im = Image.open(io.BytesIO(snapshot))
+   img_byte_arr = io.BytesIO()
+   im.save(img_byte_arr, format='PNG')
+   img_byte_arr = img_byte_arr.getvalue()
+   mqtt_publish(topics[mqttTopic], img_byte_arr) 
+
 def mqtt_publish(topic, payload, exit_on_error=True, json=False):
     global mqtt_client
 
@@ -60,8 +70,8 @@ def mqtt_publish(topic, payload, exit_on_error=True, json=False):
     )
 
     if msg.rc == mqtt.MQTT_ERR_SUCCESS:
-        msg.wait_for_publish(2)
-        return
+        msg.wait_for_publish()
+        return msg
 
     log(f"Error publishing MQTT message: {mqtt.error_string(msg.rc)}", level="ERROR")
 
@@ -80,6 +90,7 @@ def exit_gracefully(rc, skip_mqtt=False):
 
     if mqtt_client is not None and mqtt_client.is_connected() and skip_mqtt == False:
         mqtt_publish(topics["status"], "offline", exit_on_error=False)
+        mqtt_client.loop_stop(force=True)
         mqtt_client.disconnect()
 
     # Use os._exit instead of sys.exit to ensure an MQTT disconnect event causes the program to exit correctly as they
@@ -89,20 +100,24 @@ def exit_gracefully(rc, skip_mqtt=False):
 def refresh_storage_sensors():
     global camera, topics, storage_poll_interval
 
-    Timer(storage_poll_interval, refresh_storage_sensors).start()
+    #Timer(storage_poll_interval, refresh_storage_sensors).start()
     log("Fetching storage sensors...")
 
     try:
         storage = camera.storage_all
-
         mqtt_publish(topics["storage_used_percent"], str(storage["used_percent"]))
-        mqtt_publish(topics["storage_used"], to_gb(storage["used"]))
-        mqtt_publish(topics["storage_total"], to_gb(storage["total"]))
+        mqtt_publish(topics["storage_used"], str(storage["used"][0]))
+        mqtt_publish(topics["storage_total"], str(storage["total"][0]))
     except AmcrestError as error:
         log(f"Error fetching storage information {error}", level="WARNING")
 
-def to_gb(total):
-    return str(round(float(total[0]) / 1024 / 1024 / 1024, 2))
+def ping_camera():
+    Timer(30, ping_camera).start()
+    response = os.system(f"ping -c1 -W100 {amcrest_host} >/dev/null 2>&1")
+
+    if response != 0:
+        log("Ping unsuccessful", level="ERROR")
+        exit_gracefully(1)
 
 def signal_handler(sig, frame):
     # exit immediately upon receiving a second SIGINT
@@ -154,13 +169,7 @@ try:
         exit_gracefully(1)
 
     sw_version = camera.software_information[0].replace("version=", "").strip()
-    build_version = camera.software_information[1].strip()
-
-    amcrest_version = f"{sw_version} ({build_version})"
-
-    if not device_name:
-        device_name = camera.machine_name.replace("name=", "").strip()
-
+    device_name = camera.machine_name.replace("name=", "").strip()
     device_slug = slugify(device_name, separator="_")
 except AmcrestError as error:
     log(f"Error fetching camera details", level="ERROR")
@@ -168,7 +177,7 @@ except AmcrestError as error:
 
 log(f"Device type: {device_type}")
 log(f"Serial number: {serial_number}")
-log(f"Software version: {amcrest_version}")
+log(f"Software version: {sw_version}")
 log(f"Device name: {device_name}")
 
 # MQTT topics
@@ -179,30 +188,17 @@ topics = {
     "motion": f"amcrest2mqtt/{serial_number}/motion",
     "doorbell": f"amcrest2mqtt/{serial_number}/doorbell",
     "human": f"amcrest2mqtt/{serial_number}/human",
+    "snapshot": f"amcrest2mqtt/{serial_number}/snapshot",
     "storage_used": f"amcrest2mqtt/{serial_number}/storage/used",
     "storage_used_percent": f"amcrest2mqtt/{serial_number}/storage/used_percent",
     "storage_total": f"amcrest2mqtt/{serial_number}/storage/total",
-    "home_assistant_legacy": {
+    "home_assistant": {
         "doorbell": f"{home_assistant_prefix}/binary_sensor/amcrest2mqtt-{serial_number}/{device_slug}_doorbell/config",
         "human": f"{home_assistant_prefix}/binary_sensor/amcrest2mqtt-{serial_number}/{device_slug}_human/config",
         "motion": f"{home_assistant_prefix}/binary_sensor/amcrest2mqtt-{serial_number}/{device_slug}_motion/config",
         "storage_used": f"{home_assistant_prefix}/sensor/amcrest2mqtt-{serial_number}/{device_slug}_storage_used/config",
         "storage_used_percent": f"{home_assistant_prefix}/sensor/amcrest2mqtt-{serial_number}/{device_slug}_storage_used_percent/config",
         "storage_total": f"{home_assistant_prefix}/sensor/amcrest2mqtt-{serial_number}/{device_slug}_storage_total/config",
-        "version": f"{home_assistant_prefix}/sensor/amcrest2mqtt-{serial_number}/{device_slug}_version/config",
-        "host": f"{home_assistant_prefix}/sensor/amcrest2mqtt-{serial_number}/{device_slug}_host/config",
-        "serial_number": f"{home_assistant_prefix}/sensor/amcrest2mqtt-{serial_number}/{device_slug}_serial_number/config",
-    },
-    "home_assistant": {
-        "doorbell": f"{home_assistant_prefix}/binary_sensor/amcrest2mqtt-{serial_number}/doorbell/config",
-        "human": f"{home_assistant_prefix}/binary_sensor/amcrest2mqtt-{serial_number}/human/config",
-        "motion": f"{home_assistant_prefix}/binary_sensor/amcrest2mqtt-{serial_number}/motion/config",
-        "storage_used": f"{home_assistant_prefix}/sensor/amcrest2mqtt-{serial_number}/storage_used/config",
-        "storage_used_percent": f"{home_assistant_prefix}/sensor/amcrest2mqtt-{serial_number}/storage_used_percent/config",
-        "storage_total": f"{home_assistant_prefix}/sensor/amcrest2mqtt-{serial_number}/storage_total/config",
-        "version": f"{home_assistant_prefix}/sensor/amcrest2mqtt-{serial_number}/version/config",
-        "host": f"{home_assistant_prefix}/sensor/amcrest2mqtt-{serial_number}/host/config",
-        "serial_number": f"{home_assistant_prefix}/sensor/amcrest2mqtt-{serial_number}/serial_number/config",
     },
 }
 
@@ -252,15 +248,12 @@ if home_assistant:
             "manufacturer": "Amcrest",
             "model": device_type,
             "identifiers": serial_number,
-            "sw_version": amcrest_version,
+            "sw_version": sw_version,
             "via_device": "amcrest2mqtt",
         },
     }
 
     if is_doorbell:
-        doorbell_name = "Doorbell" if device_name == "Doorbell" else f"{device_name} Doorbell"
-
-        mqtt_publish(topics["home_assistant_legacy"]["doorbell"], "")
         mqtt_publish(
             topics["home_assistant"]["doorbell"],
             base_config
@@ -268,15 +261,13 @@ if home_assistant:
                 "state_topic": topics["doorbell"],
                 "payload_on": "on",
                 "payload_off": "off",
-                "icon": "mdi:doorbell",
-                "name": doorbell_name,
+                "name": f"{device_name} Doorbell",
                 "unique_id": f"{serial_number}.doorbell",
             },
             json=True,
         )
 
     if is_ad410:
-        mqtt_publish(topics["home_assistant_legacy"]["human"], "")
         mqtt_publish(
             topics["home_assistant"]["human"],
             base_config
@@ -291,7 +282,6 @@ if home_assistant:
             json=True,
         )
 
-    mqtt_publish(topics["home_assistant_legacy"]["motion"], "")
     mqtt_publish(
         topics["home_assistant"]["motion"],
         base_config
@@ -306,56 +296,7 @@ if home_assistant:
         json=True,
     )
 
-    mqtt_publish(topics["home_assistant_legacy"]["version"], "")
-    mqtt_publish(
-        topics["home_assistant"]["version"],
-        base_config
-        | {
-            "state_topic": topics["config"],
-            "value_template": "{{ value_json.sw_version }}",
-            "icon": "mdi:package-up",
-            "name": f"{device_name} Version",
-            "unique_id": f"{serial_number}.version",
-            "entity_category": "diagnostic",
-            "enabled_by_default": False
-        },
-        json=True,
-    )
-
-    mqtt_publish(topics["home_assistant_legacy"]["serial_number"], "")
-    mqtt_publish(
-        topics["home_assistant"]["serial_number"],
-        base_config
-        | {
-            "state_topic": topics["config"],
-            "value_template": "{{ value_json.serial_number }}",
-            "icon": "mdi:alphabetical-variant",
-            "name": f"{device_name} Serial Number",
-            "unique_id": f"{serial_number}.serial_number",
-            "entity_category": "diagnostic",
-            "enabled_by_default": False
-        },
-        json=True,
-    )
-
-    mqtt_publish(topics["home_assistant_legacy"]["host"], "")
-    mqtt_publish(
-        topics["home_assistant"]["host"],
-        base_config
-        | {
-            "state_topic": topics["config"],
-            "value_template": "{{ value_json.host }}",
-            "icon": "mdi:ip-network",
-            "name": f"{device_name} Host",
-            "unique_id": f"{serial_number}.host",
-            "entity_category": "diagnostic",
-            "enabled_by_default": False
-        },
-        json=True,
-    )
-
     if storage_poll_interval > 0:
-        mqtt_publish(topics["home_assistant_legacy"]["storage_used_percent"], "")
         mqtt_publish(
             topics["home_assistant"]["storage_used_percent"],
             base_config
@@ -364,14 +305,11 @@ if home_assistant:
                 "unit_of_measurement": "%",
                 "icon": "mdi:micro-sd",
                 "name": f"{device_name} Storage Used %",
-                "object_id": f"{device_slug}_storage_used_percent",
                 "unique_id": f"{serial_number}.storage_used_percent",
-                "entity_category": "diagnostic",
             },
             json=True,
         )
 
-        mqtt_publish(topics["home_assistant_legacy"]["storage_used"], "")
         mqtt_publish(
             topics["home_assistant"]["storage_used"],
             base_config
@@ -381,12 +319,10 @@ if home_assistant:
                 "icon": "mdi:micro-sd",
                 "name": f"{device_name} Storage Used",
                 "unique_id": f"{serial_number}.storage_used",
-                "entity_category": "diagnostic",
             },
             json=True,
         )
 
-        mqtt_publish(topics["home_assistant_legacy"]["storage_total"], "")
         mqtt_publish(
             topics["home_assistant"]["storage_total"],
             base_config
@@ -396,7 +332,6 @@ if home_assistant:
                 "icon": "mdi:micro-sd",
                 "name": f"{device_name} Storage Total",
                 "unique_id": f"{serial_number}.storage_total",
-                "entity_category": "diagnostic",
             },
             json=True,
         )
@@ -407,34 +342,35 @@ mqtt_publish(topics["config"], {
     "version": version,
     "device_type": device_type,
     "device_name": device_name,
-    "sw_version": amcrest_version,
+    "sw_version": sw_version,
     "serial_number": serial_number,
-    "host": amcrest_host,
 }, json=True)
 
 if storage_poll_interval > 0:
     refresh_storage_sensors()
 
+ping_camera()
+
 log("Listening for events...")
 
-async def main():
-    try:
-        async for code, payload in camera.async_event_actions("All"):
-            if (is_ad110 and code == "ProfileAlarmTransmit") or (code == "VideoMotion" and not is_ad110):
-                motion_payload = "on" if payload["action"] == "Start" else "off"
-                mqtt_publish(topics["motion"], motion_payload)
-            elif code == "CrossRegionDetection" and payload["data"]["ObjectType"] == "Human":
-                human_payload = "on" if payload["action"] == "Start" else "off"
-                mqtt_publish(topics["human"], human_payload)
-            elif code == "_DoTalkAction_":
-                doorbell_payload = "on" if payload["data"]["Action"] == "Invite" else "off"
-                mqtt_publish(topics["doorbell"], doorbell_payload)
+try:
+    for code, payload in camera.event_actions("All", retries=5, timeout_cmd=(10.00, 3600)):
+        if (is_ad110 and code == "ProfileAlarmTransmit") or (code == "VideoMotion" and not is_ad110):
+            motion_payload = "on" if payload["action"] == "Start" else "off"
+            mqtt_publish(topics["motion"], motion_payload)
+        elif code == "CrossRegionDetection" and payload["data"]["Object"]["ObjectType"] == "Human":
+            human_payload = "on" if payload["action"] == "Start" else "off"
+            if (human_payload == "on"):
+                log("human detected")
+                log(payload)
+                sendSnapshot(camera, "human")
+        elif code == "_DoTalkAction_":
+            doorbell_payload = "on" if payload["data"]["Action"] == "Invite" else "off"
+            if (doorbell_payload == "on"):
+                log("doorbell rang")
+                log(payload)
+                sendSnapshot(camera, "doorbell")
 
-            mqtt_publish(topics["event"], payload, json=True)
-            log(str(payload))
-
-    except AmcrestError as error:
-        log(f"Amcrest error: {error}", level="ERROR")
-        exit_gracefully(1)
-
-asyncio.run(main())
+except AmcrestError as error:
+    log(f"Amcrest error {error}", level="ERROR")
+    exit_gracefully(1)
